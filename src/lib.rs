@@ -1935,6 +1935,14 @@ impl<K: Hash + Eq, V> IntoIterator for LruCache<K, V> {
     }
 }
 
+impl<K: Hash + Eq, V, S: BuildHasher> Extend<(K, V)> for LruCache<K, V, S> {
+    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
+        for (k, v) in iter {
+            self.put(k, v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::LruCache;
