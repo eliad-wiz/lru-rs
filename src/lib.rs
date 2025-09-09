@@ -62,6 +62,9 @@
 #[cfg(feature = "hashbrown")]
 extern crate hashbrown;
 
+#[cfg(feature = "serde")]
+extern crate serde;
+
 #[cfg(test)]
 extern crate scoped_threadpool;
 
@@ -1632,6 +1635,127 @@ impl<K: Hash + Eq, V, S: BuildHasher> fmt::Debug for LruCache<K, V, S> {
     }
 }
 
+#[cfg(feature = "serde")]
+impl<K, V, S> serde::Serialize for LruCache<K, V, S>
+where
+    K: Hash + Eq + serde::Serialize,
+    V: serde::Serialize,
+    S: BuildHasher,
+{
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("LruCache", 2)?;
+
+        // Serialize capacity first
+        state.serialize_field("cap", &self.cap.get())?;
+
+        // Serialize entries in MRU order (most recent first)
+        let entries: alloc::vec::Vec<(&K, &V)> = self.iter().collect();
+        state.serialize_field("entries", &entries)?;
+
+        state.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, K, V, S> serde::Deserialize<'de> for LruCache<K, V, S>
+where
+    K: Hash + Eq + serde::Deserialize<'de>,
+    V: serde::Deserialize<'de>,
+    S: BuildHasher + Default,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use alloc::vec::Vec;
+        use serde::de::{self, MapAccess, Visitor};
+
+        #[derive(serde::Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Cap,
+            Entries,
+        }
+
+        struct LruCacheVisitor<K, V, S> {
+            phantom: PhantomData<(K, V, S)>,
+        }
+
+        impl<'de, K, V, S> Visitor<'de> for LruCacheVisitor<K, V, S>
+        where
+            K: Hash + Eq + serde::Deserialize<'de>,
+            V: serde::Deserialize<'de>,
+            S: BuildHasher + Default,
+        {
+            type Value = LruCache<K, V, S>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct LruCache")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut cap = None;
+                let mut entries = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Cap => {
+                            if cap.is_some() {
+                                return Err(de::Error::duplicate_field("cap"));
+                            }
+                            let cap_val: usize = map.next_value()?;
+                            cap = Some(NonZeroUsize::new(cap_val).ok_or_else(|| {
+                                de::Error::invalid_value(
+                                    de::Unexpected::Unsigned(cap_val as u64),
+                                    &"a non-zero usize",
+                                )
+                            })?);
+                        }
+                        Field::Entries => {
+                            if entries.is_some() {
+                                return Err(de::Error::duplicate_field("entries"));
+                            }
+                            entries = Some(map.next_value::<Vec<(K, V)>>()?);
+                        }
+                    }
+                }
+
+                let cap = cap.ok_or_else(|| de::Error::missing_field("cap"))?;
+                let entries = entries.ok_or_else(|| de::Error::missing_field("entries"))?;
+
+                // Create new cache with specified capacity
+                let mut cache = LruCache::with_hasher(cap, S::default());
+
+                // Insert entries in the order they were serialized (MRU order)
+                // We insert them in reverse order so that the first item in the
+                // serialized list (most recent) ends up being the most recent after insertion
+                for (k, v) in entries.into_iter().rev() {
+                    cache.put(k, v);
+                }
+
+                Ok(cache)
+            }
+        }
+
+        const FIELDS: &'static [&'static str] = &["cap", "entries"];
+        deserializer.deserialize_struct(
+            "LruCache",
+            FIELDS,
+            LruCacheVisitor {
+                phantom: PhantomData,
+            },
+        )
+    }
+}
+
 /// An iterator over the entries of a `LruCache`.
 ///
 /// This `struct` is created by the [`iter`] method on [`LruCache`][`LruCache`]. See its
@@ -2865,3 +2989,157 @@ mod tests {
 /// let _: Option<(_, &'static u32)> = cache.peek_lru();
 /// ```
 fn _test_lifetimes() {}
+
+#[cfg(all(feature = "serde", test))]
+mod serde_tests {
+    use super::*;
+    use alloc::string::{String, ToString};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    extern crate serde_json;
+    extern crate std;
+
+    #[test]
+    fn test_serialize_empty_cache() {
+        let cache: LruCache<String, i32> = LruCache::new(NonZeroUsize::new(5).unwrap());
+        let serialized = serde_json::to_string(&cache).unwrap();
+        let expected = r#"{"cap":5,"entries":[]}"#;
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_preserves_mru_order() {
+        let mut cache = LruCache::new(NonZeroUsize::new(4).unwrap());
+
+        // Insert items in order: a, b, c, d
+        cache.put("a".to_string(), 1);
+        cache.put("b".to_string(), 2);
+        cache.put("c".to_string(), 3);
+        cache.put("d".to_string(), 4);
+
+        // Access "a" to make it most recent: a, d, c, b (MRU order)
+        cache.get(&"a".to_string());
+
+        // Access "c" to make it most recent: c, a, d, b (MRU order)
+        cache.get(&"c".to_string());
+
+        // Current MRU order should be: c, a, d, b (most recent first)
+        let original_order: Vec<(&String, &i32)> = cache.iter().collect();
+        assert_eq!(original_order.len(), 4);
+        assert_eq!(original_order[0].0, &"c".to_string());
+        assert_eq!(original_order[1].0, &"a".to_string());
+        assert_eq!(original_order[2].0, &"d".to_string());
+        assert_eq!(original_order[3].0, &"b".to_string());
+
+        // Serialize and deserialize
+        let serialized = serde_json::to_string(&cache).unwrap();
+        let deserialized: LruCache<String, i32> = serde_json::from_str(&serialized).unwrap();
+
+        // Check that capacity is preserved
+        assert_eq!(deserialized.cap().get(), 4);
+        assert_eq!(deserialized.len(), 4);
+
+        // Check that MRU order is preserved
+        let deserialized_order: Vec<(&String, &i32)> = deserialized.iter().collect();
+        assert_eq!(deserialized_order.len(), 4);
+        assert_eq!(deserialized_order[0].0, &"c".to_string());
+        assert_eq!(deserialized_order[1].0, &"a".to_string());
+        assert_eq!(deserialized_order[2].0, &"d".to_string());
+        assert_eq!(deserialized_order[3].0, &"b".to_string());
+
+        // Verify that accessing items still maintains proper LRU behavior
+        let mut deserialized = deserialized;
+        deserialized.get(&"d".to_string()); // Move "d" to front
+        let new_order: Vec<(&String, &i32)> = deserialized.iter().collect();
+        assert_eq!(new_order[0].0, &"d".to_string()); // "d" should now be most recent
+    }
+
+    #[test]
+    fn test_serialize_deserialize_with_complex_types() {
+        let mut cache = LruCache::new(NonZeroUsize::new(3).unwrap());
+
+        cache.put("key1".to_string(), vec![1, 2, 3]);
+        cache.put("key2".to_string(), vec![4, 5, 6]);
+        cache.put("key3".to_string(), vec![7, 8, 9]);
+
+        let serialized = serde_json::to_string(&cache).unwrap();
+        let deserialized: LruCache<String, Vec<i32>> = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.cap().get(), 3);
+        assert_eq!(deserialized.len(), 3);
+
+        // Check values are preserved
+        assert_eq!(deserialized.peek(&"key1".to_string()), Some(&vec![1, 2, 3]));
+        assert_eq!(deserialized.peek(&"key2".to_string()), Some(&vec![4, 5, 6]));
+        assert_eq!(deserialized.peek(&"key3".to_string()), Some(&vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn test_serialize_deserialize_full_cache_eviction_behavior() {
+        let mut cache = LruCache::new(NonZeroUsize::new(2).unwrap());
+
+        cache.put("a".to_string(), 1);
+        cache.put("b".to_string(), 2);
+        cache.put("c".to_string(), 3); // This should evict "a"
+
+        // MRU order should be: c, b
+        let original_order: Vec<(&String, &i32)> = cache.iter().collect();
+        assert_eq!(original_order.len(), 2);
+        assert_eq!(original_order[0].0, &"c".to_string());
+        assert_eq!(original_order[1].0, &"b".to_string());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.peek(&"a".to_string()).is_none());
+
+        // Serialize and deserialize
+        let serialized = serde_json::to_string(&cache).unwrap();
+        let mut deserialized: LruCache<String, i32> = serde_json::from_str(&serialized).unwrap();
+
+        // Verify same state after deserialization
+        assert_eq!(deserialized.len(), 2);
+        assert_eq!(deserialized.peek(&"c".to_string()), Some(&3));
+        assert_eq!(deserialized.peek(&"b".to_string()), Some(&2));
+        assert_eq!(deserialized.peek(&"a".to_string()), None);
+
+        // Verify LRU behavior still works correctly
+        deserialized.put("d".to_string(), 4); // Should evict "b"
+        assert_eq!(deserialized.len(), 2);
+        assert_eq!(deserialized.peek(&"d".to_string()), Some(&4));
+        assert_eq!(deserialized.peek(&"c".to_string()), Some(&3));
+        assert_eq!(deserialized.peek(&"b".to_string()), None);
+    }
+
+    #[test]
+    fn test_deserialize_invalid_capacity() {
+        let invalid_json = r#"{"cap":0,"entries":[]}"#;
+        let result: Result<LruCache<String, i32>, _> = serde_json::from_str(invalid_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_round_trip_maintains_functionality() {
+        let mut original = LruCache::new(NonZeroUsize::new(3).unwrap());
+        original.put("x".to_string(), 10);
+        original.put("y".to_string(), 20);
+        original.put("z".to_string(), 30);
+
+        // Make "x" most recent
+        original.get(&"x".to_string());
+
+        // Serialize -> Deserialize
+        let serialized = serde_json::to_string(&original).unwrap();
+        let mut restored: LruCache<String, i32> = serde_json::from_str(&serialized).unwrap();
+
+        // Test that all LRU operations work correctly on restored cache
+        assert_eq!(restored.get(&"x".to_string()), Some(&10));
+        assert_eq!(restored.get(&"y".to_string()), Some(&20));
+        assert_eq!(restored.get(&"z".to_string()), Some(&30));
+
+        // Test put with eviction
+        restored.put("new".to_string(), 40); // Should evict least recent
+        assert_eq!(restored.len(), 3);
+        assert!(restored.contains(&"new".to_string()));
+
+        // Test that capacity is preserved
+        assert_eq!(restored.cap(), original.cap());
+    }
+}
