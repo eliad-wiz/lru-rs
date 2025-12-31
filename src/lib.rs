@@ -579,6 +579,35 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
         }
     }
 
+    /// Gets the given key's corresponding entry in the cache for in-place manipulation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// // Insert a value via the entry API
+    /// cache.entry("a").or_insert(1);
+    /// assert_eq!(cache.get(&"a"), Some(&1));
+    ///
+    /// // Modify an existing value
+    /// cache.entry("a").and_modify(|v| *v += 1).or_insert(0);
+    /// assert_eq!(cache.get(&"a"), Some(&2));
+    ///
+    /// // Insert with a closure
+    /// cache.entry("b").or_insert_with(|| 42);
+    /// assert_eq!(cache.get(&"b"), Some(&42));
+    /// ```
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S> {
+        match self.map.get(&KeyRef { k: &key }).copied() {
+            Some(node) => Entry::Occupied(OccupiedEntry { cache: self, node }),
+            None => Entry::Vacant(VacantEntry { cache: self, key }),
+        }
+    }
+
     /// Returns a reference to the value of the key in the cache if it is
     /// present in the cache and moves the key to the head of the LRU list.
     /// If the key does not exist the provided `FnOnce` is used to populate
@@ -1599,6 +1628,471 @@ impl<K, V, S> Drop for LruCache<K, V, S> {
 
         let _head = unsafe { *Box::from_raw(self.head) };
         let _tail = unsafe { *Box::from_raw(self.tail) };
+    }
+}
+
+/// A view into a single entry in an LruCache, which may either be vacant or occupied.
+///
+/// This `enum` is constructed from the [`entry`] method on [`LruCache`].
+///
+/// [`entry`]: struct.LruCache.html#method.entry
+/// [`LruCache`]: struct.LruCache.html
+pub enum Entry<'a, K: 'a, V: 'a, S: 'a> {
+    /// An occupied entry.
+    Occupied(OccupiedEntry<'a, K, V, S>),
+    /// A vacant entry.
+    Vacant(VacantEntry<'a, K, V, S>),
+}
+
+/// A view into an occupied entry in an LruCache.
+///
+/// It is part of the [`Entry`] enum.
+///
+/// [`Entry`]: enum.Entry.html
+pub struct OccupiedEntry<'a, K: 'a, V: 'a, S: 'a> {
+    cache: &'a mut LruCache<K, V, S>,
+    node: NonNull<LruEntry<K, V>>,
+}
+
+/// A view into a vacant entry in an LruCache.
+///
+/// It is part of the [`Entry`] enum.
+///
+/// [`Entry`]: enum.Entry.html
+pub struct VacantEntry<'a, K: 'a, V: 'a, S: 'a> {
+    cache: &'a mut LruCache<K, V, S>,
+    key: K,
+}
+
+impl<'a, K: Hash + Eq, V: 'a, S: BuildHasher> OccupiedEntry<'a, K, V, S> {
+    /// Returns a reference to the key of the entry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    ///
+    /// if let lru::Entry::Occupied(entry) = cache.entry("a") {
+    ///     assert_eq!(entry.key(), &"a");
+    /// }
+    /// ```
+    pub fn key(&self) -> &K {
+        unsafe { &*(*self.node.as_ptr()).key.as_ptr() }
+    }
+
+    /// Returns a reference to the value in the entry.
+    /// This also moves the entry to the most-recently-used position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    ///
+    /// if let lru::Entry::Occupied(mut entry) = cache.entry("a") {
+    ///     assert_eq!(entry.get(), &1);
+    /// }
+    /// ```
+    pub fn get(&mut self) -> &V {
+        self.promote();
+        unsafe { &*(*self.node.as_ptr()).val.as_ptr() }
+    }
+
+    /// Returns a mutable reference to the value in the entry.
+    /// This also moves the entry to the most-recently-used position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    ///
+    /// if let lru::Entry::Occupied(mut entry) = cache.entry("a") {
+    ///     *entry.get_mut() += 1;
+    ///     assert_eq!(entry.get(), &2);
+    /// }
+    /// ```
+    pub fn get_mut(&mut self) -> &mut V {
+        self.promote();
+        unsafe { &mut *(*self.node.as_ptr()).val.as_mut_ptr() }
+    }
+
+    /// Converts the OccupiedEntry into a mutable reference to the value in the entry
+    /// with a lifetime bound to the cache itself.
+    /// This also moves the entry to the most-recently-used position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    ///
+    /// if let lru::Entry::Occupied(entry) = cache.entry("a") {
+    ///     let value = entry.into_mut();
+    ///     *value += 1;
+    /// }
+    /// assert_eq!(cache.get(&"a"), Some(&2));
+    /// ```
+    pub fn into_mut(mut self) -> &'a mut V {
+        self.promote();
+        unsafe { &mut *(*self.node.as_ptr()).val.as_mut_ptr() }
+    }
+
+    /// Sets the value of the entry with the OccupiedEntry's key, and returns the old value.
+    /// This also moves the entry to the most-recently-used position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    ///
+    /// if let lru::Entry::Occupied(mut entry) = cache.entry("a") {
+    ///     let old = entry.insert(2);
+    ///     assert_eq!(old, 1);
+    /// }
+    /// assert_eq!(cache.get(&"a"), Some(&2));
+    /// ```
+    pub fn insert(&mut self, value: V) -> V {
+        self.promote();
+        unsafe { mem::replace(&mut *(*self.node.as_ptr()).val.as_mut_ptr(), value) }
+    }
+
+    /// Takes the value of the entry out of the cache, and returns it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    ///
+    /// if let lru::Entry::Occupied(entry) = cache.entry("a") {
+    ///     let value = entry.remove();
+    ///     assert_eq!(value, 1);
+    /// }
+    /// assert_eq!(cache.len(), 1);
+    /// ```
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+
+    /// Takes the key-value pair out of the cache, and returns it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    ///
+    /// if let lru::Entry::Occupied(entry) = cache.entry("a") {
+    ///     let (key, value) = entry.remove_entry();
+    ///     assert_eq!(key, "a");
+    ///     assert_eq!(value, 1);
+    /// }
+    /// assert_eq!(cache.len(), 1);
+    /// ```
+    pub fn remove_entry(self) -> (K, V) {
+        let key = unsafe { &*(*self.node.as_ptr()).key.as_ptr() };
+        let key_ref = KeyRef { k: key };
+
+        // Remove from map
+        let old_node = self.cache.map.remove(&key_ref).unwrap();
+        let node_ptr = old_node.as_ptr();
+
+        // Detach from linked list
+        self.cache.detach(node_ptr);
+
+        // Extract key and value
+        unsafe {
+            let node = *Box::from_raw(node_ptr);
+            let LruEntry { key, val, .. } = node;
+            (key.assume_init(), val.assume_init())
+        }
+    }
+
+    /// Peek at the value without updating the LRU position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    ///
+    /// // "a" is currently least recently used
+    /// if let lru::Entry::Occupied(entry) = cache.entry("a") {
+    ///     // peek doesn't update LRU position
+    ///     assert_eq!(entry.peek(), &1);
+    /// }
+    /// ```
+    pub fn peek(&self) -> &V {
+        unsafe { &*(*self.node.as_ptr()).val.as_ptr() }
+    }
+
+    /// Peek at the value mutably without updating the LRU position.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.put("a", 1);
+    /// cache.put("b", 2);
+    ///
+    /// // "a" is currently least recently used
+    /// if let lru::Entry::Occupied(mut entry) = cache.entry("a") {
+    ///     // peek_mut doesn't update LRU position
+    ///     *entry.peek_mut() = 10;
+    /// }
+    /// assert_eq!(cache.peek(&"a"), Some(&10));
+    /// ```
+    pub fn peek_mut(&mut self) -> &mut V {
+        unsafe { &mut *(*self.node.as_ptr()).val.as_mut_ptr() }
+    }
+
+    // Internal helper to move the entry to the front of the LRU list
+    fn promote(&mut self) {
+        let node_ptr = self.node.as_ptr();
+        self.cache.detach(node_ptr);
+        self.cache.attach(node_ptr);
+    }
+}
+
+impl<'a, K: Hash + Eq, V: 'a, S: BuildHasher> VacantEntry<'a, K, V, S> {
+    /// Returns a reference to the key that would be used when inserting a value
+    /// through the VacantEntry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// if let lru::Entry::Vacant(entry) = cache.entry("a") {
+    ///     assert_eq!(entry.key(), &"a");
+    /// }
+    /// ```
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Take ownership of the key.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<String, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// if let lru::Entry::Vacant(entry) = cache.entry("a".to_string()) {
+    ///     let key = entry.into_key();
+    ///     assert_eq!(key, "a");
+    /// }
+    /// ```
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Sets the value of the entry with the VacantEntry's key, and returns a mutable
+    /// reference to it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// if let lru::Entry::Vacant(entry) = cache.entry("a") {
+    ///     let value = entry.insert(1);
+    ///     assert_eq!(value, &mut 1);
+    /// }
+    /// assert_eq!(cache.get(&"a"), Some(&1));
+    /// ```
+    pub fn insert(self, value: V) -> &'a mut V {
+        let (_, node) = self.cache.replace_or_create_node(self.key, value);
+        let node_ptr: *mut LruEntry<K, V> = node.as_ptr();
+
+        self.cache.attach(node_ptr);
+
+        let keyref = unsafe { (*node_ptr).key.as_ptr() };
+        self.cache.map.insert(KeyRef { k: keyref }, node);
+        unsafe { &mut *(*node_ptr).val.as_mut_ptr() }
+    }
+}
+
+impl<'a, K: Hash + Eq, V: 'a, S: BuildHasher> Entry<'a, K, V, S> {
+    /// Returns a reference to this entry's key.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// assert_eq!(cache.entry("a").key(), &"a");
+    /// ```
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the default if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// cache.entry("a").or_insert(3);
+    /// assert_eq!(cache.get(&"a"), Some(&3));
+    ///
+    /// *cache.entry("a").or_insert(10) *= 2;
+    /// assert_eq!(cache.get(&"a"), Some(&6));
+    /// ```
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default function if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, String> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// let s = "hello".to_string();
+    ///
+    /// cache.entry("a").or_insert_with(|| s);
+    /// assert_eq!(cache.get(&"a"), Some(&"hello".to_string()));
+    /// ```
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting, if empty, the result of the default function.
+    /// This method allows for generating key-derived values for insertion by providing the default
+    /// function a reference to the key that was moved during the `.entry(key)` method call.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, usize> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// cache.entry("a").or_insert_with_key(|key| key.len());
+    /// assert_eq!(cache.get(&"a"), Some(&1));
+    /// ```
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = default(entry.key());
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any potential inserts
+    /// into the cache.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    ///
+    /// cache.entry("a")
+    ///     .and_modify(|v| *v += 1)
+    ///     .or_insert(0);
+    /// assert_eq!(cache.get(&"a"), Some(&0));
+    ///
+    /// cache.entry("a")
+    ///     .and_modify(|v| *v += 1)
+    ///     .or_insert(0);
+    /// assert_eq!(cache.get(&"a"), Some(&1));
+    /// ```
+    pub fn and_modify<F: FnOnce(&mut V)>(mut self, f: F) -> Self {
+        if let Entry::Occupied(ref mut entry) = self {
+            f(entry.get_mut());
+        }
+        self
+    }
+}
+
+impl<'a, K: Hash + Eq, V: Default + 'a, S: BuildHasher> Entry<'a, K, V, S> {
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lru::LruCache;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let mut cache: LruCache<&str, Option<u32>> = LruCache::new(NonZeroUsize::new(2).unwrap());
+    /// cache.entry("a").or_default();
+    /// assert_eq!(cache.get(&"a"), Some(&None));
+    /// ```
+    pub fn or_default(self) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(V::default()),
+        }
     }
 }
 
